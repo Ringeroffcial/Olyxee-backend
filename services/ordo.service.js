@@ -1,9 +1,10 @@
 import { v4 as uuidv4 } from 'uuid';
 import EventEmitter from 'events';
+import SiyandaEngine from '../engine/siyanda.engine.js';
 
-// Job state management
+// In-memory job state management (no database)
 class JobStore {
-  #jobs = new Map();  // Private field
+  #jobs = new Map();  // Private field - all in memory
   
   set(jobId, jobData) {
     this.#jobs.set(jobId, jobData);
@@ -24,6 +25,14 @@ class JobStore {
   has(jobId) {
     return this.#jobs.has(jobId);
   }
+  
+  delete(jobId) {
+    return this.#jobs.delete(jobId);
+  }
+  
+  getAll() {
+    return Array.from(this.#jobs.values());
+  }
 }
 
 class OrdoService {
@@ -35,39 +44,52 @@ class OrdoService {
   
   // ========== MAIN PROCESS METHOD ==========
   async process(payload) {
-    console.log('📥 Received payload:', JSON.stringify(payload, null, 2));
+    console.log('📥 [Mahlori] Received payload:', JSON.stringify(payload, null, 2));
     
     try {
-      // 1. Validate structure
+      // 1. Validate structure (Mahlori's first responsibility)
       this.#validateStructure(payload);
       
-      // 2. Create job
+      // 2. Create job with unique ID
       const job = this.#createJob(payload);
       
       // 3. Split plan into steps
       const { steps, stepsMap } = this.#splitPlanIntoSteps(payload.plan);
       
-      // 4. Define execution order
+      // 4. Define execution order based on constraints
       const executionOrder = this.#defineExecutionOrder(steps, payload.constraints);
       
-      // Store steps in job
-      this.#jobStore.update(job.id, { steps, executionOrder });
+      // Store steps and execution order in job (in-memory)
+      this.#jobStore.update(job.id, { 
+        steps, 
+        stepsMap,
+        executionOrder,
+        entities: payload.entities,
+        constraints: payload.constraints
+      });
       
-      // Async execution (don't block response)
-      this.#executeJob(job.id, steps, executionOrder, payload.entities);
+      // 5. Pass to Siyanda for execution (async, don't block response)
+      this.#executeJob(job.id, steps, executionOrder, payload.entities, payload.constraints);
       
+      console.log(`✅ [Mahlori] Job ${job.id} queued successfully`);
+      
+      // Return immediate acknowledgment
       return {
         jobId: job.id,
+        goal: payload.goal,
         totalSteps: steps.length,
         executionOrder: executionOrder.type,
-        status: 'queued'
+        status: 'queued',
+        timestamp: new Date().toISOString()
       };
       
     } catch (error) {
+      console.error(`❌ [Mahlori] Processing failed: ${error.message}`);
       throw new Error(`Processing failed: ${error.message}`);
     }
   }
   
+  // ========== GET JOB STATUS ==========
   async getJobStatus(jobId) {
     const job = this.#jobStore.get(jobId);
     
@@ -77,17 +99,36 @@ class OrdoService {
     
     return {
       jobId: job.id,
+      goal: job.goal,
       status: job.status,
       progress: job.progress,
       completedSteps: job.completedSteps ?? 0,
       totalSteps: job.steps?.length ?? 0,
       result: job.result,
+      finalDecision: job.finalDecision,
+      reasons: job.reasons,
+      actions: job.actions,
       error: job.error,
+      blockingReason: job.blockingReason,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+      completedAt: job.completedAt
+    };
+  }
+  
+  // ========== GET ALL JOBS ==========
+  async getAllJobs() {
+    return this.#jobStore.getAll().map(job => ({
+      jobId: job.id,
+      goal: job.goal,
+      status: job.status,
+      progress: job.progress,
       createdAt: job.createdAt,
       updatedAt: job.updatedAt
-    };
-  } 
-  // ========== 1. VALIDATE STRUCTURE (Private) ==========
+    }));
+  }
+  
+  // ========== 1. VALIDATE STRUCTURE (Mahlori) ==========
   #validateStructure(payload) {
     // Check required fields
     const missingFields = this.#requiredFields.filter(
@@ -98,6 +139,11 @@ class OrdoService {
       throw new Error(`Missing required fields: ${missingFields.join(', ')}`);
     }
     
+    // Validate goal is present and non-empty
+    if (typeof payload.goal !== 'string' || payload.goal.trim().length === 0) {
+      throw new Error('Goal must be a non-empty string');
+    }
+    
     // Validate plan is array
     if (!Array.isArray(payload.plan)) {
       throw new Error('Plan must be an array');
@@ -106,16 +152,40 @@ class OrdoService {
     if (payload.plan.length === 0) {
       throw new Error('Plan cannot be empty');
     }
+    
     // Validate each step has required properties
     payload.plan.forEach((step, index) => {
       if (!step.action) {
         throw new Error(`Step ${index + 1} missing 'action' property`);
       }
+      
+      // Validate action type is supported (no DB needed)
+      const supportedActions = [
+        'log', 'calculate', 'transform_data', 'wait', 
+        'send_notification', 'validate_compliance', 'branch',
+        'mock_api_call', 'update_status', 'webhook'
+      ];
+      
+      if (!supportedActions.includes(step.action)) {
+        console.warn(`⚠️ Warning: Step ${index + 1} uses action '${step.action}' - make sure it's implemented in Siyanda`);
+      }
     });
-    console.log('✅ Structure validation passed');
+    
+    // Validate entities is object
+    if (typeof payload.entities !== 'object' || payload.entities === null) {
+      throw new Error('Entities must be an object');
+    }
+    
+    // Validate constraints is object
+    if (typeof payload.constraints !== 'object' || payload.constraints === null) {
+      throw new Error('Constraints must be an object');
+    }
+    
+    console.log('✅ [Mahlori] Structure validation passed');
     return true;
   }
-
+  
+  // ========== 2. CREATE JOB (Mahlori) ==========
   #createJob(payload) {
     const job = {
       id: uuidv4(),
@@ -123,42 +193,55 @@ class OrdoService {
       status: 'pending',
       progress: 0,
       completedSteps: 0,
+      failedSteps: 0,
+      blockedSteps: 0,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       entities: { ...payload.entities },
-      constraints: { ...payload.constraints }
+      constraints: { ...payload.constraints },
+      steps: [],
+      stepsMap: new Map(),
+      executionOrder: null,
+      result: null,
+      finalDecision: null,
+      reasons: [],
+      actions: [],
+      error: null,
+      blockingReason: null
     };
     
     this.#jobStore.set(job.id, job);
-    console.log(`📋 Job created: ${job.id}`);
+    console.log(`📋 [Mahlori] Job created: ${job.id}`);
     
     return job;
   }
   
-  // ========== 3. SPLIT PLAN INTO STEPS (Private) ==========
+  // ========== 3. SPLIT PLAN INTO STEPS (Mahlori) ==========
   #splitPlanIntoSteps(plan) {
     const steps = plan.map((step, index) => ({
       id: uuidv4(),
       order: index,
       name: step.name ?? `Step_${index + 1}`,
       action: step.action,
-      input: { ...step.input },
+      input: step.input ? { ...step.input } : {},
       dependencies: step.depends_on ?? [],
-      status: 'pending',
+      status: 'pending', // pending, running, completed, failed, blocked, skipped
       result: null,
       error: null,
+      retryCount: 0,
       startedAt: null,
-      completedAt: null
+      completedAt: null,
+      metadata: step.metadata || {}
     }));
     
     // Create map for quick lookup
     const stepsMap = new Map(steps.map(step => [step.id, step]));
     
-    console.log(`📊 Split plan into ${steps.length} steps`);
+    console.log(`📊 [Mahlori] Split plan into ${steps.length} steps`);
     return { steps, stepsMap };
   }
   
-  // ========== 4. DEFINE EXECUTION ORDER (Private) ==========
+  // ========== 4. DEFINE EXECUTION ORDER (Mahlori) ==========
   #defineExecutionOrder(steps, constraints) {
     const executionType = constraints?.execution_order ?? 'sequential';
     
@@ -168,16 +251,22 @@ class OrdoService {
       dag: () => this.#buildDAGOrder(steps)
     };
     
-    const strategy = strategies[executionType] ?? strategies.sequential;
+    const strategy = strategies[executionType];
+    if (!strategy) {
+      throw new Error(`Unsupported execution order type: ${executionType}`);
+    }
+    
     const order = strategy();
     
-    console.log(`🔀 Execution order: ${executionType}`);
+    console.log(`🔀 [Mahlori] Execution order: ${executionType}`);
     
     return {
       type: executionType,
       order,
       maxRetries: constraints?.max_retries ?? 0,
-      timeoutMs: constraints?.timeout_seconds ?? 30 * 1000
+      timeoutMs: (constraints?.timeout_seconds ?? 30) * 1000,
+      onError: constraints?.on_error ?? 'fail', // fail, continue, retry
+      rollbackOnFailure: constraints?.rollback_on_failure ?? false
     };
   }
   
@@ -192,17 +281,17 @@ class OrdoService {
   }
   
   #buildDAGOrder(steps) {
-    // Topological sort for DAG
+    // Topological sort for DAG based on dependencies
     const graph = new Map();
     const inDegree = new Map();
     
-    // Initialize
+    // Initialize graph
     steps.forEach(step => {
       graph.set(step.id, [...step.dependencies]);
       inDegree.set(step.id, step.dependencies.length);
     });
     
-    // Kahn's algorithm
+    // Kahn's algorithm for topological sort
     const queue = steps.filter(s => inDegree.get(s.id) === 0).map(s => s.id);
     const result = [];
     
@@ -231,13 +320,13 @@ class OrdoService {
     return result;
   }
   
-  // ========== EXECUTE JOB (Private) ==========
-  async #executeJob(jobId, steps, executionOrder, entities) {
+  // ========== EXECUTE JOB (Mahlori passes to Siyanda) ==========
+  async #executeJob(jobId, steps, executionOrder, entities, constraints) {
     const job = this.#jobStore.get(jobId);
     job.status = 'running';
     job.updatedAt = new Date().toISOString();
     
-    console.log(`🚀 Starting execution of job ${jobId}`);
+    console.log(`🚀 [Mahlori] Starting execution of job ${jobId}, delegating to Siyanda`);
     
     try {
       const results = await this.#runExecutionStrategy(
@@ -245,70 +334,165 @@ class OrdoService {
         steps,
         executionOrder.order,
         entities,
-        executionOrder
+        executionOrder,
+        constraints,
+        jobId
       );
+      
+      // Determine final outcome based on results
+      const finalOutcome = this.#determineFinalOutcome(results, constraints);
       
       // Update job as completed
       this.#jobStore.update(jobId, {
-        status: 'completed',
+        status: finalOutcome.status,
         progress: 100,
-        completedSteps: steps.length,
+        completedSteps: steps.filter(s => s.status === 'completed').length,
+        failedSteps: steps.filter(s => s.status === 'failed').length,
+        blockedSteps: steps.filter(s => s.status === 'blocked').length,
         result: results,
+        finalDecision: finalOutcome.decision,
+        reasons: finalOutcome.reasons,
+        actions: finalOutcome.actions,
+        completedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       });
       
-      console.log(`✅ Job ${jobId} completed successfully`);
+      console.log(`✅ [Mahlori] Job ${jobId} completed with status: ${finalOutcome.status}`);
+      
+      // Emit event for listeners
+      this.#eventEmitter.emit('jobCompleted', {
+        jobId,
+        status: finalOutcome.status,
+        result: results
+      });
       
     } catch (error) {
-      // Update job as failed
+      // Update job as failed or blocked
+      const status = error.type === 'blocked' ? 'blocked' : 'failed';
+      
       this.#jobStore.update(jobId, {
-        status: 'failed',
+        status: status,
         error: error.message,
-        updatedAt: new Date().toISOString()
+        blockingReason: error.type === 'blocked' ? error.reason : null,
+        updatedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString()
       });
       
-      console.error(`❌ Job ${jobId} failed:`, error.message);
+      console.error(`❌ [Mahlori] Job ${jobId} ${status}:`, error.message);
+      
+      // Emit error event
+      this.#eventEmitter.emit('jobFailed', {
+        jobId,
+        status,
+        error: error.message
+      });
     }
   }
   
-  async #runExecutionStrategy(type, steps, order, entities, config) {
+  // ========== RUN EXECUTION STRATEGY ==========
+  async #runExecutionStrategy(type, steps, order, entities, config, constraints, jobId) {
     const stepMap = new Map(steps.map(s => [s.id, s]));
     
     switch (type) {
       case 'sequential':
-        return this.#runSequential(order, stepMap, entities, config);
+        return this.#runSequential(order, stepMap, entities, config, constraints, jobId);
         
       case 'parallel':
-        return this.#runParallel(order[0], stepMap, entities, config);
+        return this.#runParallel(order[0], stepMap, entities, config, constraints, jobId);
         
       case 'dag':
-        return this.#runSequential(order, stepMap, entities, config);
+        return this.#runSequential(order, stepMap, entities, config, constraints, jobId);
         
       default:
-        return this.#runSequential(order, stepMap, entities, config);
+        return this.#runSequential(order, stepMap, entities, config, constraints, jobId);
     }
   }
   
-  async #runSequential(order, stepMap, entities, config) {
+  // ========== SEQUENTIAL EXECUTION ==========
+  async #runSequential(order, stepMap, entities, config, constraints, jobId) {
     const results = [];
+    let currentEntities = { ...entities };
     
     for (const stepId of order) {
       const step = stepMap.get(stepId);
       step.status = 'running';
       step.startedAt = new Date().toISOString();
       
-      console.log(`⚙️ Executing step: ${step.name} (${step.action})`);
+      console.log(`⚙️ [Mahlori -> Siyanda] Executing step: ${step.name} (${step.action})`);
       
       try {
-        const result = await this.#executeStep(step, entities, config);
+        // Pass to Siyanda for actual execution (no DB)
+        const result = await this.#executeStepWithRetry(
+          step, 
+          currentEntities, 
+          config, 
+          constraints,
+          jobId
+        );
+        
         step.status = 'completed';
         step.result = result;
-        results.push({ stepId, stepName: step.name, result });
+        results.push({ 
+          stepId, 
+          stepName: step.name, 
+          action: step.action,
+          result,
+          timestamp: new Date().toISOString()
+        });
+        
+        // Update entities with results if needed
+        if (result.data && result.data.updatedEntities) {
+          currentEntities = { ...currentEntities, ...result.data.updatedEntities };
+        }
+        
+        // Update job progress
+        const completedCount = Array.from(stepMap.values()).filter(s => s.status === 'completed').length;
+        this.#jobStore.update(jobId, {
+          progress: Math.floor((completedCount / stepMap.size) * 100),
+          completedSteps: completedCount,
+          updatedAt: new Date().toISOString()
+        });
         
       } catch (error) {
-        step.status = 'failed';
+        step.status = error.type === 'blocked' ? 'blocked' : 'failed';
         step.error = error.message;
-        throw new Error(`Step ${step.name} failed: ${error.message}`);
+        
+        // Handle based on error configuration
+        if (config.onError === 'continue' && error.type !== 'blocked') {
+          console.warn(`⚠️ Step ${step.name} failed but continuing: ${error.message}`);
+          results.push({ 
+            stepId, 
+            stepName: step.name, 
+            error: error.message,
+            skipped: true
+          });
+          continue;
+        } else if (config.onError === 'retry' && step.retryCount < config.maxRetries) {
+          step.retryCount++;
+          console.log(`🔄 Retrying step ${step.name} (attempt ${step.retryCount}/${config.maxRetries})`);
+          step.status = 'pending';
+          // Re-execute the same step
+          const retryResult = await this.#executeStepWithRetry(
+            step, 
+            currentEntities, 
+            config, 
+            constraints,
+            jobId
+          );
+          step.status = 'completed';
+          step.result = retryResult;
+          results.push({ 
+            stepId, 
+            stepName: step.name, 
+            action: step.action,
+            result: retryResult,
+            retried: true,
+            timestamp: new Date().toISOString()
+          });
+        } else {
+          // Fail or block the entire job
+          throw error;
+        }
       }
       
       step.completedAt = new Date().toISOString();
@@ -317,51 +501,177 @@ class OrdoService {
     return results;
   }
   
-  async #runParallel(stepIds, stepMap, entities, config) {
+  // ========== PARALLEL EXECUTION ==========
+  async #runParallel(stepIds, stepMap, entities, config, constraints, jobId) {
     const stepExecutions = stepIds.map(async (stepId) => {
       const step = stepMap.get(stepId);
       step.status = 'running';
       step.startedAt = new Date().toISOString();
       
       try {
-        const result = await this.#executeStep(step, entities, config);
+        const result = await this.#executeStepWithRetry(
+          step, 
+          entities, 
+          config, 
+          constraints,
+          jobId
+        );
+        
         step.status = 'completed';
         step.result = result;
         step.completedAt = new Date().toISOString();
-        return { stepId, stepName: step.name, result };
+        
+        return { stepId, stepName: step.name, action: step.action, result };
       } catch (error) {
-        step.status = 'failed';
+        step.status = error.type === 'blocked' ? 'blocked' : 'failed';
         step.error = error.message;
         throw error;
       }
     });
     
-    return Promise.all(stepExecutions);
+    const results = await Promise.allSettled(stepExecutions);
+    
+    // Update progress
+    const completedCount = Array.from(stepMap.values()).filter(s => s.status === 'completed').length;
+    this.#jobStore.update(jobId, {
+      progress: Math.floor((completedCount / stepMap.size) * 100),
+      completedSteps: completedCount,
+      updatedAt: new Date().toISOString()
+    });
+    
+    // Filter and return only fulfilled results
+    return results
+      .filter(r => r.status === 'fulfilled')
+      .map(r => r.value);
   }
   
-  async #executeStep(step, entities, config) {
-    // Simulate step execution (replace with actual logic)
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error(`Step ${step.name} timed out after ${config.timeoutMs}ms`));
-      }, config.timeoutMs);
-      
-      // Simulate work
-      setTimeout(() => {
-        clearTimeout(timeout);
+  // ========== EXECUTE STEP WITH RETRY LOGIC ==========
+  async #executeStepWithRetry(step, entities, config, constraints, jobId, attempt = 1) {
+    let lastError = null;
+    
+    for (let currentAttempt = attempt; currentAttempt <= config.maxRetries + 1; currentAttempt++) {
+      try {
+        // Delegate to Siyanda for actual execution
+        // Siyanda handles: constraints, branching, failures (no DB)
+        const result = await SiyandaEngine.executeStep(
+          step,           // The step to execute
+          entities,       // Current entities/data
+          constraints,    // Global constraints
+          config,         // Execution config (timeout, etc.)
+          jobId,          // For tracking
+          currentAttempt  // Current attempt number
+        );
         
-        // Mock execution based on action type
-        const result = {
-          action: step.action,
-          input: step.input,
-          entitiesUsed: entities,
-          output: `Executed ${step.name} successfully`,
-          timestamp: new Date().toISOString()
-        };
+        return result;
         
-        resolve(result);
-      }, 100);
-    });
+      } catch (error) {
+        lastError = error;
+        
+        if (currentAttempt <= config.maxRetries && error.retryable !== false) {
+          const delay = Math.min(1000 * Math.pow(2, currentAttempt - 1), 10000); // Exponential backoff
+          console.log(`🔄 Retry ${currentAttempt}/${config.maxRetries} for step ${step.name} after ${delay}ms`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        } else {
+          break;
+        }
+      }
+    }
+    
+    throw lastError;
+  }
+  
+  // ========== DETERMINE FINAL OUTCOME ==========
+  #determineFinalOutcome(results, constraints) {
+    // Analyze results to determine final status matching the spec
+    // Outcomes: completed, blocked, failed, requires_action
+    
+    const failedSteps = results.filter(r => r.error);
+    const blockedSteps = results.filter(r => r.result?.status === 'blocked' || r.blocked);
+    const requiresActionSteps = results.filter(r => r.result?.requiresAction === true);
+    
+    let status = 'completed';
+    let decision = 'Goal achieved successfully';
+    const reasons = [];
+    const actions = [];
+    
+    if (blockedSteps.length > 0) {
+      status = 'blocked';
+      decision = 'Workflow blocked due to constraint violations';
+      blockedSteps.forEach(step => {
+        reasons.push(step.error || step.result?.reason || 'Constraint violation');
+      });
+      actions.push('Review constraints and modify input', 'Retry with corrected data');
+    } else if (requiresActionSteps.length > 0) {
+      status = 'requires_action';
+      decision = 'Manual intervention required to continue';
+      requiresActionSteps.forEach(step => {
+        reasons.push(step.result?.message || 'Manual action needed');
+        if (step.result?.actions) {
+          actions.push(...step.result.actions);
+        }
+      });
+    } else if (failedSteps.length > 0) {
+      status = 'failed';
+      decision = 'Workflow failed during execution';
+      failedSteps.forEach(step => {
+        reasons.push(step.error || 'Unknown error');
+      });
+      actions.push('Check execution logs', 'Verify step inputs', 'Retry the workflow');
+    } else {
+      // All steps completed successfully
+      status = 'completed';
+      decision = `Successfully completed all ${results.length} steps`;
+      reasons.push('All steps executed without errors');
+      actions.push('Workflow complete - no further action needed');
+    }
+    
+    return { status, decision, reasons, actions };
+  }
+  
+  // ========== EVENT HANDLERS ==========
+  on(event, callback) {
+    this.#eventEmitter.on(event, callback);
+  }
+  
+  off(event, callback) {
+    this.#eventEmitter.off(event, callback);
+  }
+  
+  once(event, callback) {
+    this.#eventEmitter.once(event, callback);
+  }
+  
+  // ========== CLEANUP ==========
+  async cleanup(maxAgeHours = 24) {
+    const jobs = this.#jobStore.getAll();
+    const now = new Date();
+    let cleaned = 0;
+    
+    for (const job of jobs) {
+      const age = (now - new Date(job.completedAt || job.createdAt)) / (1000 * 60 * 60);
+      if (age > maxAgeHours) {
+        this.#jobStore.delete(job.id);
+        cleaned++;
+      }
+    }
+    
+    console.log(`🧹 Cleaned up ${cleaned} old jobs from memory`);
+    return cleaned;
+  }
+  
+  // ========== GET STATISTICS ==========
+  getStats() {
+    const jobs = this.#jobStore.getAll();
+    return {
+      totalJobs: jobs.length,
+      completed: jobs.filter(j => j.status === 'completed').length,
+      failed: jobs.filter(j => j.status === 'failed').length,
+      blocked: jobs.filter(j => j.status === 'blocked').length,
+      running: jobs.filter(j => j.status === 'running').length,
+      pending: jobs.filter(j => j.status === 'pending').length,
+      requiresAction: jobs.filter(j => j.status === 'requires_action').length,
+      memoryUsage: process.memoryUsage().heapUsed / 1024 / 1024 + ' MB'
+    };
   }
 }
 
