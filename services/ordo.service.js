@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import EventEmitter from 'events';
 import SiyandaEngine from '../engine/siyanda.engine.js';
+import DecisionEngine from '../engine/decision.engine.js'; // Import DecisionEngine
 
 // In-memory job state management (no database)
 class JobStore {
@@ -108,6 +109,7 @@ class OrdoService {
       finalDecision: job.finalDecision,
       reasons: job.reasons,
       actions: job.actions,
+      decision: job.decision, // Add this for consistency
       error: job.error,
       blockingReason: job.blockingReason,
       createdAt: job.createdAt,
@@ -159,11 +161,14 @@ class OrdoService {
         throw new Error(`Step ${index + 1} missing 'action' property`);
       }
       
-      // Validate action type is supported (no DB needed)
+      // Validate action type is supported
       const supportedActions = [
         'log', 'calculate', 'transform_data', 'wait', 
         'send_notification', 'validate_compliance', 'branch',
-        'mock_api_call', 'update_status', 'webhook'
+        'mock_api_call', 'update_status', 'webhook',
+        'fetch_provider_profile', 'fetch_compliance_documents',
+        'evaluate_mandatory_requirements', 'evaluate_business_value',
+        'detect_risk_conflicts', 'generate_decision', 'generate_final_decision'
       ];
       
       if (!supportedActions.includes(step.action)) {
@@ -204,6 +209,7 @@ class OrdoService {
       executionOrder: null,
       result: null,
       finalDecision: null,
+      decision: null, // Add decision field
       reasons: [],
       actions: [],
       error: null,
@@ -221,7 +227,7 @@ class OrdoService {
     const steps = plan.map((step, index) => ({
       id: uuidv4(),
       order: index,
-      name: step.name ?? `Step_${index + 1}`,
+      name: step.name ?? step.action ?? `Step_${index + 1}`,
       action: step.action,
       input: step.input ? { ...step.input } : {},
       dependencies: step.depends_on ?? [],
@@ -340,7 +346,7 @@ class OrdoService {
       );
       
       // Determine final outcome based on results
-      const finalOutcome = this.#determineFinalOutcome(results, constraints);
+      const finalOutcome = this.#determineFinalOutcome(results, constraints, entities);
       
       // Update job as completed
       this.#jobStore.update(jobId, {
@@ -351,6 +357,7 @@ class OrdoService {
         blockedSteps: steps.filter(s => s.status === 'blocked').length,
         result: results,
         finalDecision: finalOutcome.decision,
+        decision: finalOutcome.decision,
         reasons: finalOutcome.reasons,
         actions: finalOutcome.actions,
         completedAt: new Date().toISOString(),
@@ -358,12 +365,17 @@ class OrdoService {
       });
       
       console.log(`✅ [Mahlori] Job ${jobId} completed with status: ${finalOutcome.status}`);
+      console.log(`📊 Decision: ${finalOutcome.decision}`);
+      console.log(`📝 Reasons: ${finalOutcome.reasons.join(', ')}`);
+      console.log(`⚡ Actions: ${finalOutcome.actions.join(', ')}`);
       
       // Emit event for listeners
       this.#eventEmitter.emit('jobCompleted', {
         jobId,
         status: finalOutcome.status,
-        result: results
+        decision: finalOutcome.decision,
+        reasons: finalOutcome.reasons,
+        actions: finalOutcome.actions
       });
       
     } catch (error) {
@@ -372,6 +384,8 @@ class OrdoService {
       
       this.#jobStore.update(jobId, {
         status: status,
+        decision: status === 'blocked' ? 'blocked' : 'failed',
+        finalDecision: status === 'blocked' ? 'Workflow blocked' : 'Workflow failed',
         error: error.message,
         blockingReason: error.type === 'blocked' ? error.reason : null,
         updatedAt: new Date().toISOString(),
@@ -421,14 +435,33 @@ class OrdoService {
       console.log(`⚙️ [Mahlori -> Siyanda] Executing step: ${step.name} (${step.action})`);
       
       try {
-        // Pass to Siyanda for actual execution (no DB)
-        const result = await this.#executeStepWithRetry(
-          step, 
-          currentEntities, 
-          config, 
-          constraints,
-          jobId
-        );
+        // Special handling for generate_decision steps - use DecisionEngine
+        let result;
+        if (step.action === 'generate_decision' || step.action === 'generate_final_decision') {
+          console.log('🎯 Using DecisionEngine for final decision');
+          const decisionResult = DecisionEngine.generateDecisions(currentEntities);
+          result = {
+            success: true,
+            data: decisionResult,
+            requiresAction: decisionResult.status === 'blocked',
+            metadata: {
+              action: step.action,
+              executedBy: 'DecisionEngine',
+              timestamp: new Date().toISOString(),
+              jobId,
+              attempt: 1
+            }
+          };
+        } else {
+          // Pass to Siyanda for actual execution
+          result = await this.#executeStepWithRetry(
+            step, 
+            currentEntities, 
+            config, 
+            constraints,
+            jobId
+          );
+        }
         
         step.status = 'completed';
         step.result = result;
@@ -443,6 +476,17 @@ class OrdoService {
         // Update entities with results if needed
         if (result.data && result.data.updatedEntities) {
           currentEntities = { ...currentEntities, ...result.data.updatedEntities };
+        }
+        
+        // If this was a decision step, store the decision data
+        if ((step.action === 'generate_decision' || step.action === 'generate_final_decision') && result.data) {
+          console.log('💾 Storing decision from DecisionEngine');
+          this.#jobStore.update(jobId, {
+            decision: result.data.decision,
+            finalDecision: result.data.decision,
+            reasons: result.data.reasons || result.data.blockers || [],
+            actions: result.data.actions || []
+          });
         }
         
         // Update job progress
@@ -509,13 +553,30 @@ class OrdoService {
       step.startedAt = new Date().toISOString();
       
       try {
-        const result = await this.#executeStepWithRetry(
-          step, 
-          entities, 
-          config, 
-          constraints,
-          jobId
-        );
+        let result;
+        if (step.action === 'generate_decision' || step.action === 'generate_final_decision') {
+          const decisionResult = DecisionEngine.generateDecisions(entities);
+          result = {
+            success: true,
+            data: decisionResult,
+            requiresAction: decisionResult.status === 'blocked',
+            metadata: {
+              action: step.action,
+              executedBy: 'DecisionEngine',
+              timestamp: new Date().toISOString(),
+              jobId,
+              attempt: 1
+            }
+          };
+        } else {
+          result = await this.#executeStepWithRetry(
+            step, 
+            entities, 
+            config, 
+            constraints,
+            jobId
+          );
+        }
         
         step.status = 'completed';
         step.result = result;
@@ -552,14 +613,13 @@ class OrdoService {
     for (let currentAttempt = attempt; currentAttempt <= config.maxRetries + 1; currentAttempt++) {
       try {
         // Delegate to Siyanda for actual execution
-        // Siyanda handles: constraints, branching, failures (no DB)
         const result = await SiyandaEngine.executeStep(
-          step,           // The step to execute
-          entities,       // Current entities/data
-          constraints,    // Global constraints
-          config,         // Execution config (timeout, etc.)
-          jobId,          // For tracking
-          currentAttempt  // Current attempt number
+          step,
+          entities,
+          constraints,
+          config,
+          jobId,
+          currentAttempt
         );
         
         return result;
@@ -568,7 +628,7 @@ class OrdoService {
         lastError = error;
         
         if (currentAttempt <= config.maxRetries && error.retryable !== false) {
-          const delay = Math.min(1000 * Math.pow(2, currentAttempt - 1), 10000); // Exponential backoff
+          const delay = Math.min(1000 * Math.pow(2, currentAttempt - 1), 10000);
           console.log(`🔄 Retry ${currentAttempt}/${config.maxRetries} for step ${step.name} after ${delay}ms`);
           await new Promise(resolve => setTimeout(resolve, delay));
         } else {
@@ -581,10 +641,55 @@ class OrdoService {
   }
   
   // ========== DETERMINE FINAL OUTCOME ==========
-  #determineFinalOutcome(results, constraints) {
-    // Analyze results to determine final status matching the spec
-    // Outcomes: completed, blocked, failed, requires_action
+  #determineFinalOutcome(results, constraints, entities) {
+    // First, check if we have a decision from DecisionEngine
+    const decisionStep = results.find(r => 
+      r.action === 'generate_decision' || 
+      r.action === 'generate_final_decision' ||
+      r.result?.data?.decision
+    );
     
+    if (decisionStep && decisionStep.result && decisionStep.result.data) {
+      const decisionData = decisionStep.result.data;
+      
+      // Map DecisionEngine output to required format
+      let status = 'completed';
+      let decision = decisionData.decision || 'pending';
+      
+      // Determine status based on decision
+      if (decisionData.decision === 'blocked') {
+        status = 'blocked';
+      } else if (decisionData.decision === 'conditionally_approved') {
+        status = 'completed';
+        decision = 'conditionally_approved';
+      } else if (decisionData.decision === 'approved') {
+        status = 'completed';
+        decision = 'approved';
+      } else if (decisionData.status === 'blocked') {
+        status = 'blocked';
+      }
+      
+      // Collect reasons (prioritize blockers, then reasons)
+      const reasons = [];
+      if (decisionData.blockers && decisionData.blockers.length > 0) {
+        reasons.push(...decisionData.blockers);
+      }
+      if (decisionData.reasons && decisionData.reasons.length > 0) {
+        reasons.push(...decisionData.reasons);
+      }
+      
+      // Collect actions
+      const actions = decisionData.actions || [];
+      
+      return {
+        status,
+        decision,
+        reasons: reasons.length > 0 ? reasons : ['No specific reasons provided'],
+        actions: actions.length > 0 ? actions : ['Review decision details']
+      };
+    }
+    
+    // Fallback: Analyze results for errors/blockers
     const failedSteps = results.filter(r => r.error);
     const blockedSteps = results.filter(r => r.result?.status === 'blocked' || r.blocked);
     const requiresActionSteps = results.filter(r => r.result?.requiresAction === true);
@@ -596,23 +701,21 @@ class OrdoService {
     
     if (blockedSteps.length > 0) {
       status = 'blocked';
-      decision = 'Workflow blocked due to constraint violations';
+      decision = 'blocked';
       blockedSteps.forEach(step => {
         reasons.push(step.error || step.result?.reason || 'Constraint violation');
       });
       actions.push('Review constraints and modify input', 'Retry with corrected data');
     } else if (requiresActionSteps.length > 0) {
       status = 'requires_action';
-      decision = 'Manual intervention required to continue';
+      decision = 'Manual intervention required';
       requiresActionSteps.forEach(step => {
         reasons.push(step.result?.message || 'Manual action needed');
-        if (step.result?.actions) {
-          actions.push(...step.result.actions);
-        }
+        if (step.result?.actions) actions.push(...step.result.actions);
       });
     } else if (failedSteps.length > 0) {
       status = 'failed';
-      decision = 'Workflow failed during execution';
+      decision = 'failed';
       failedSteps.forEach(step => {
         reasons.push(step.error || 'Unknown error');
       });
@@ -620,7 +723,7 @@ class OrdoService {
     } else {
       // All steps completed successfully
       status = 'completed';
-      decision = `Successfully completed all ${results.length} steps`;
+      decision = 'completed';
       reasons.push('All steps executed without errors');
       actions.push('Workflow complete - no further action needed');
     }

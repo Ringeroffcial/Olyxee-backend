@@ -1,6 +1,14 @@
-// Junior will Work here
+import express from 'express';
+import OrdoController from '../Controllers/ordo.controller.js';
 
-// make use of express library
-// Use Get methods to get the Routes
+const router = express.Router();
 
-//and call the router name (OrdoRoute) inside index.js
+router.post('/execute', OrdoController.execute.bind(OrdoController));
+
+router.get('/status/:jobId', OrdoController.getJobStatus.bind(OrdoController));
+
+router.get('/result/:jobId', OrdoController.getJobResult.bind(OrdoController));
+
+router.get('/job/:jobId/status', OrdoController.getJobResult.bind(OrdoController));
+
+export default router;
