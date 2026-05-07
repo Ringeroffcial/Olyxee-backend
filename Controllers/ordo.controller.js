@@ -1,7 +1,7 @@
 import OrdoService from '../services/ordo.service.js';
 
 class OrdoController {
-  // Private static method for consistent response
+  // Private static method for consistent response (only for non-spec endpoints)
   static #sendResponse(res, statusCode, data) {
     return res.status(statusCode).json({
       timestamp: new Date().toISOString(),
@@ -13,7 +13,6 @@ class OrdoController {
     try {
       const { body: jsonPayload } = req;
       
-      // Validate request body
       if (!jsonPayload || typeof jsonPayload !== 'object') {
         return OrdoController.#sendResponse(res, 400, {
           status: 'error',
@@ -23,7 +22,6 @@ class OrdoController {
       
       const result = await OrdoService.process(jsonPayload);
       
-      // Return immediate acknowledgment
       return OrdoController.#sendResponse(res, 200, {
         status: 'success',
         data: result
@@ -39,6 +37,7 @@ class OrdoController {
     }
   }
 
+  // Status endpoint (detailed - includes progress, etc.)
   static async getJobStatus(req, res) {
     try {
       const { jobId } = req.params;
@@ -50,33 +49,21 @@ class OrdoController {
         });
       }
       
-      const jobData = await OrdoService.getJobStatus(jobId);
+      const status = await OrdoService.getJobStatus(jobId);
       
-      // Format to match required output spec (Section 5)
-      const requiredFormat = {
-        status: jobData.status === 'completed' ? 'completed' :
-                jobData.status === 'blocked' ? 'blocked' :
-                jobData.status === 'failed' ? 'failed' : 'requires_action',
-        decision: jobData.finalDecision || jobData.decision || 'Processing',
-        reasons: jobData.reasons || [],
-        actions: jobData.actions || []
-      };
-      
-      // Return in the exact required format (no wrapper)
-      return res.status(200).json(requiredFormat);
-      
+      return OrdoController.#sendResponse(res, 200, {
+        status: 'success',
+        data: status
+      });
     } catch (error) {
-      // Error format also matches spec
-      return res.status(404).json({
-        status: 'failed',
-        decision: 'Job not found',
-        reasons: [`Job ${req.params.jobId} not found`],
-        actions: ['Verify job ID is correct', 'Check if job has expired', 'Contact support if issue persists']
+      return OrdoController.#sendResponse(res, 404, {
+        status: 'error',
+        error: `Job ${req.params.jobId} not found`
       });
     }
   }
 
-  // New endpoint that returns ONLY the final result in required format
+  // RESULT endpoint - EXACTLY matches required spec (Section 5)
   static async getJobResult(req, res) {
     try {
       const { jobId } = req.params;
@@ -102,12 +89,29 @@ class OrdoController {
         });
       }
       
-      // Return EXACTLY the required format
+      // Check if job failed or was blocked
+      if (jobData.status === 'failed') {
+        return res.status(200).json({
+          status: 'failed',
+          decision: jobData.decision || 'Workflow failed',
+          reasons: jobData.reasons || [jobData.error || 'Unknown error'],
+          actions: jobData.actions || ['Check logs', 'Verify inputs', 'Retry workflow']
+        });
+      }
+      
+      if (jobData.status === 'blocked') {
+        return res.status(200).json({
+          status: 'blocked',
+          decision: jobData.decision || 'Workflow blocked',
+          reasons: jobData.reasons || [jobData.blockingReason || 'Constraint violation'],
+          actions: jobData.actions || ['Review constraints', 'Fix violations', 'Retry workflow']
+        });
+      }
+      
+      // Return EXACTLY the required format (no wrapper, no extra fields)
       const finalResult = {
-        status: jobData.status === 'completed' ? 'completed' :
-                jobData.status === 'blocked' ? 'blocked' :
-                jobData.status === 'failed' ? 'failed' : 'requires_action',
-        decision: jobData.finalDecision || jobData.decision || 'No decision available',
+        status: 'completed',
+        decision: jobData.decision || jobData.finalDecision || 'Goal achieved',
         reasons: jobData.reasons || [],
         actions: jobData.actions || []
       };
@@ -119,9 +123,148 @@ class OrdoController {
         status: 'failed',
         decision: 'Job not found',
         reasons: [error.message || `Job ${req.params.jobId} not found`],
-        actions: ['Verify job ID', 'Check if job exists in system']
+        actions: ['Verify job ID is correct', 'Check if job has expired', 'Contact support']
       });
     }
+  }
+
+  // Download full result file (for archiving/audit)
+  static async downloadResultFile(req, res) {
+    try {
+      const { jobId } = req.params;
+      
+      if (!jobId) {
+        return OrdoController.#sendResponse(res, 400, {
+          status: 'error',
+          error: 'Job ID is required'
+        });
+      }
+      
+      const resultData = await OrdoService.readResultFromFile(jobId);
+      
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename=result_${jobId}.json`);
+      return res.status(200).json(resultData);
+      
+    } catch (error) {
+      return OrdoController.#sendResponse(res, 404, {
+        status: 'error',
+        error: error.message
+      });
+    }
+  }
+
+  // Get result file path info
+  static async getResultFileInfo(req, res) {
+    try {
+      const { jobId } = req.params;
+      
+      if (!jobId) {
+        return OrdoController.#sendResponse(res, 400, {
+          status: 'error',
+          error: 'Job ID is required'
+        });
+      }
+      
+      const filePath = await OrdoService.getResultFile(jobId);
+      
+      if (!filePath) {
+        return OrdoController.#sendResponse(res, 404, {
+          status: 'error',
+          error: 'No result file found for this job'
+        });
+      }
+      
+      return OrdoController.#sendResponse(res, 200, {
+        status: 'success',
+        data: {
+          jobId,
+          resultFile: filePath
+        }
+      });
+      
+    } catch (error) {
+      return OrdoController.#sendResponse(res, 404, {
+        status: 'error',
+        error: error.message
+      });
+    }
+  }
+
+  // List all jobs (for debugging)
+  static async listAllJobs(req, res) {
+    try {
+      const jobs = await OrdoService.getAllJobs();
+      const stats = await OrdoService.getJobStats();
+      
+      return OrdoController.#sendResponse(res, 200, {
+        status: 'success',
+        data: {
+          activeJobs: jobs.length,
+          stats: stats,
+          jobs: jobs
+        }
+      });
+    } catch (error) {
+      return OrdoController.#sendResponse(res, 500, {
+        status: 'error',
+        error: error.message
+      });
+    }
+  }
+
+  // Get job statistics
+  static async getStats(req, res) {
+    try {
+      const stats = await OrdoService.getJobStats();
+      return OrdoController.#sendResponse(res, 200, {
+        status: 'success',
+        data: stats
+      });
+    } catch (error) {
+      return OrdoController.#sendResponse(res, 500, {
+        status: 'error',
+        error: error.message
+      });
+    }
+  }
+
+  // Clear all jobs (admin only - use with caution)
+  static async clearAllJobs(req, res) {
+    try {
+      // Optional: Add admin authentication here
+      // const apiKey = req.headers['x-api-key'];
+      // if (apiKey !== 'your-secret-key') {
+      //   return OrdoController.#sendResponse(res, 401, {
+      //     status: 'error',
+      //     error: 'Unauthorized'
+      //   });
+      // }
+      
+      await OrdoService.clearAllJobs();
+      return OrdoController.#sendResponse(res, 200, {
+        status: 'success',
+        message: 'All jobs cleared successfully'
+      });
+    } catch (error) {
+      return OrdoController.#sendResponse(res, 500, {
+        status: 'error',
+        error: error.message
+      });
+    }
+  }
+
+  // Health check endpoint
+  static async healthCheck(req, res) {
+    return OrdoController.#sendResponse(res, 200, {
+      status: 'success',
+      data: {
+        service: 'Ordo Workflow Engine',
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        version: '1.0.0'
+      }
+    });
   }
 }
 

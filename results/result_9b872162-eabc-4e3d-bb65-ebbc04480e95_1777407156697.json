@@ -1,0 +1,48 @@
+{
+  "metadata": {
+    "jobId": "9b872162-eabc-4e3d-bb65-ebbc04480e95",
+    "goal": "Determine whether Discovery should approve onboarding of MedCare Plus Clinic into the Gauteng wellness network for Q3 expansion.",
+    "createdAt": "2026-04-28T20:12:36.654Z",
+    "completedAt": "2026-04-28T20:12:36.697Z",
+    "totalSteps": 6,
+    "completedSteps": 6,
+    "exportedAt": "2026-04-28T20:12:36.697Z"
+  },
+  "decision": {
+    "status": "completed",
+    "decision": "conditionally_approved",
+    "reasons": [
+      "Mandatory onboarding documents missing",
+      "Contract issue: Non-standard indemnity clause requested by provider",
+      "BBBEE certificate expiring soon"
+    ],
+    "actions": [
+      "Submit required missing documents",
+      "Resolve the contract issue",
+      "Renew BBBEE certification"
+    ]
+  },
+  "businessContext": {
+    "providerName": "MedCare Plus Clinic",
+    "providerType": "Primary Healthcare Clinic",
+    "region": "Gauteng",
+    "serviceCoverageImpact": "high",
+    "bbbeeLevel": "Level 2",
+    "contractReviewStatus": "flagged"
+  },
+  "fullResult": {
+    "status": "completed",
+    "decision": "conditionally_approved",
+    "reasons": [
+      "Mandatory onboarding documents missing",
+      "Contract issue: Non-standard indemnity clause requested by provider",
+      "BBBEE certificate expiring soon"
+    ],
+    "actions": [
+      "Submit required missing documents",
+      "Resolve the contract issue",
+      "Renew BBBEE certification"
+    ]
+  },
+  "timestamp": "2026-04-28T20:12:36.697Z"
+}
