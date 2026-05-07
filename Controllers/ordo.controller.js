@@ -1,3 +1,4 @@
+// controllers/ordo.controller.js
 import OrdoService from '../services/ordo.service.js';
 
 class OrdoController {
@@ -8,36 +9,66 @@ class OrdoController {
       ...data
     });
   }
-
+  // Validates and queues jobs for processing
   static async execute(req, res) {
     try {
       const { body: jsonPayload } = req;
       
-      if (!jsonPayload || typeof jsonPayload !== 'object') {
+      // Strict input validation - reject invalid or malformed requests
+      if (!jsonPayload) {
         return OrdoController.#sendResponse(res, 400, {
           status: 'error',
-          error: 'Invalid request body'
+          error: 'Request body is required'
         });
       }
       
+      // Reject raw text - only structured JSON objects are allowed
+      if (typeof jsonPayload === 'string') {
+        return OrdoController.#sendResponse(res, 400, {
+          status: 'error',
+          error: 'Raw text not allowed. Please provide structured JSON object.',
+          hint: 'Request body must be a JSON object with fields: goal, plan, entities, constraints'
+        });
+      }
+      
+      // Reject arrays or other non-object types
+      if (typeof jsonPayload !== 'object' || Array.isArray(jsonPayload)) {
+        return OrdoController.#sendResponse(res, 400, {
+          status: 'error',
+          error: 'Invalid request body. Expected JSON object, got ' + (Array.isArray(jsonPayload) ? 'array' : typeof jsonPayload)
+        });
+      }
+      
+      // Delegate to OrdoService which uses Mahlori for strict validation
       const result = await OrdoService.process(jsonPayload);
       
+      // Return success response with validation proof
       return OrdoController.#sendResponse(res, 200, {
         status: 'success',
-        data: result
+        data: result,
+        validatedBy: 'Mahlori',
+        validationTimestamp: new Date().toISOString()
       });
       
     } catch (error) {
       console.error('❌ Execution error:', error.message);
       
-      return OrdoController.#sendResponse(res, error.statusCode || 400, {
+      // Differentiate between validation errors (client fault) and execution errors (server fault)
+      const isValidationError = error.message.includes('MAHLORI') || 
+                                error.message.includes('validation') ||
+                                error.message.includes('Missing required') ||
+                                error.message.includes('unsupported');
+      
+      const statusCode = isValidationError ? 400 : 500;
+      
+      return OrdoController.#sendResponse(res, statusCode, {
         status: 'error',
         error: error.message
       });
     }
   }
 
-  // Status endpoint (detailed - includes progress, etc.)
+  // Returns current state, completed steps, and any errors
   static async getJobStatus(req, res) {
     try {
       const { jobId } = req.params;
@@ -62,8 +93,7 @@ class OrdoController {
       });
     }
   }
-
-  // RESULT endpoint - EXACTLY matches required spec (Section 5)
+  // Returns final decision with reasons and actions in standardized format
   static async getJobResult(req, res) {
     try {
       const { jobId } = req.params;
@@ -79,7 +109,7 @@ class OrdoController {
       
       const jobData = await OrdoService.getJobStatus(jobId);
       
-      // Check if job is still processing
+      // Job is still processing - return 202 Accepted with status info
       if (jobData.status === 'pending' || jobData.status === 'queued' || jobData.status === 'running') {
         return res.status(202).json({
           status: 'requires_action',
@@ -89,7 +119,7 @@ class OrdoController {
         });
       }
       
-      // Check if job failed or was blocked
+      // Job failed - return failure details with remediation actions
       if (jobData.status === 'failed') {
         return res.status(200).json({
           status: 'failed',
@@ -99,6 +129,7 @@ class OrdoController {
         });
       }
       
+      // Job blocked by constraints - return blocking reasons
       if (jobData.status === 'blocked') {
         return res.status(200).json({
           status: 'blocked',
@@ -108,7 +139,7 @@ class OrdoController {
         });
       }
       
-      // Return EXACTLY the required format (no wrapper, no extra fields)
+      // Job completed successfully - return final decision in spec-compliant format
       const finalResult = {
         status: 'completed',
         decision: jobData.decision || jobData.finalDecision || 'Goal achieved',
@@ -128,7 +159,7 @@ class OrdoController {
     }
   }
 
-  // Download full result file (for archiving/audit)
+  // Returns full JSON file with all execution details
   static async downloadResultFile(req, res) {
     try {
       const { jobId } = req.params;
@@ -154,7 +185,7 @@ class OrdoController {
     }
   }
 
-  // Get result file path info
+  // FILE INFO ENDPOINT - Get result file path (for debugging)
   static async getResultFileInfo(req, res) {
     try {
       const { jobId } = req.params;
@@ -191,7 +222,7 @@ class OrdoController {
     }
   }
 
-  // List all jobs (for debugging)
+  // Returns summary of all jobs with their current status
   static async listAllJobs(req, res) {
     try {
       const jobs = await OrdoService.getAllJobs();
@@ -213,7 +244,7 @@ class OrdoController {
     }
   }
 
-  // Get job statistics
+  // Returns counts of jobs by status and system health info
   static async getStats(req, res) {
     try {
       const stats = await OrdoService.getJobStats();
@@ -229,17 +260,9 @@ class OrdoController {
     }
   }
 
-  // Clear all jobs (admin only - use with caution)
+  // Removes all job data from the system
   static async clearAllJobs(req, res) {
     try {
-      // Optional: Add admin authentication here
-      // const apiKey = req.headers['x-api-key'];
-      // if (apiKey !== 'your-secret-key') {
-      //   return OrdoController.#sendResponse(res, 401, {
-      //     status: 'error',
-      //     error: 'Unauthorized'
-      //   });
-      // }
       
       await OrdoService.clearAllJobs();
       return OrdoController.#sendResponse(res, 200, {
@@ -254,7 +277,7 @@ class OrdoController {
     }
   }
 
-  // Health check endpoint
+  // Returns system status and version information
   static async healthCheck(req, res) {
     return OrdoController.#sendResponse(res, 200, {
       status: 'success',

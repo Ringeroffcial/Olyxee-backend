@@ -1,25 +1,7 @@
 // engine/mahlori.engine.js
 import { v4 as uuidv4 } from 'uuid';
 
-/**
- * MAHLORI - Entry and Orchestration Layer
- * 
- * STRICT RESPONSIBILITIES:
- * 1. Validate incoming JSON structure
- * 2. Create and track job
- * 3. Split plan into executable steps (without modification)
- * 4. Define execution order based on constraints
- * 5. Pass UNMODIFIED structured payload to Siyanda
- * 
- * FORBIDDEN ACTIONS:
- * - ❌ Processing raw text
- * - ❌ Changing/Modifying the original plan
- * - ❌ Making business decisions
- * - ❌ Executing steps directly
- */
-
 class MahloriEngine {
-  // Required fields - STRICT validation
   static #REQUIRED_FIELDS = ['goal', 'plan', 'entities', 'constraints'];
   
   // Supported action types (whitelist)
@@ -32,10 +14,6 @@ class MahloriEngine {
     'detect_risk_conflicts', 'generate_decision', 'generate_final_decision'
   ]);
 
-  /**
-   * MAIN ENTRY POINT - Process incoming request
-   * Returns structured job or throws validation error
-   */
   static process(rawPayload) {
     console.log('🔷 [Mahlori] Starting entry validation');
     
@@ -185,16 +163,10 @@ class MahloriEngine {
     return job;
   }
 
-  /**
-   * SPLIT PLAN INTO STEPS - NO MODIFICATION OF BUSINESS LOGIC
-   * Only adds metadata (id, order, status tracking)
-   */
+
   static #splitPlanToSteps(originalPlan) {
-    // CRITICAL: Create steps WITHOUT modifying original business logic
     const steps = originalPlan.map((step, index) => ({
-      // Preserve ALL original properties
       ...step,
-      // Add tracking metadata only (doesn't change business logic)
       id: uuidv4(),
       order: index,
       status: 'pending',
@@ -229,9 +201,7 @@ class MahloriEngine {
     return { steps, stepsMap };
   }
 
-  /**
-   * DEFINE EXECUTION ORDER - Based on constraints, not on content
-   */
+
   static #defineExecutionOrder(steps, constraints) {
     const executionType = constraints?.execution_order || 'sequential';
     
@@ -263,17 +233,14 @@ class MahloriEngine {
   }
 
   static #buildSequentialOrder(steps) {
-    // Pure sequential based on original order
     return steps.sort((a, b) => a.order - b.order).map(s => s.id);
   }
 
   static #buildParallelOrder(steps) {
-    // All steps can run in parallel (ignoring dependencies)
     return [steps.map(s => s.id)];
   }
 
   static #buildDAGOrder(steps) {
-    // Topological sort based on dependencies
     const graph = new Map();
     const inDegree = new Map();
     
@@ -306,13 +273,6 @@ class MahloriEngine {
     
     return result;
   }
-
-  /**
-   * PREPARE PAYLOAD FOR SIYANDA
-   * - Passes UNMODIFIED steps
-   * - Passes clean entities and constraints
-   * - NO business logic, NO text processing
-   */
   static #prepareSiyandaPayload(jobId, steps, executionConfig, entities, constraints) {
     // Create a CLEAN payload for Siyanda
     const payload = {
@@ -324,14 +284,14 @@ class MahloriEngine {
         order: step.order,
         name: step.name,
         action: step.action,
-        input: step.input,  // Original, unmodified input
+        input: step.input, 
         dependencies: step.depends_on || [],
         metadata: step.metadata || {}
       })),
       executionConfig: executionConfig,
-      entities: { ...entities },  // Fresh copy
-      constraints: { ...constraints },  // Fresh copy
-      // Add validation proof
+      entities: { ...entities },
+      constraints: { ...constraints }, 
+     
       _validation: {
         validatedBy: 'Mahlori',
         validatedAt: new Date().toISOString(),
@@ -339,18 +299,13 @@ class MahloriEngine {
         originalGoalHash: this.#hashString(constraints?.goal || '')
       }
     };
-    
-    // Verify no raw text in payload (except goal which is allowed)
+
     this.#verifyNoRawTextProcessing(payload);
     
     return payload;
   }
 
-  /**
-   * VERIFY that Mahlori didn't process any raw text
-   */
   static #verifyNoRawTextProcessing(payload) {
-    // This is a safety check - Mahlori should never process text content
     const stringifyPayload = JSON.stringify(payload);
     
     // Look for patterns that would indicate text processing
@@ -366,8 +321,6 @@ class MahloriEngine {
     for (const pattern of suspiciousPatterns) {
       if (pattern.test(stringifyPayload)) {
         console.warn('⚠️ [Mahlori] Warning: Possible text processing detected');
-        // In strict mode, this would throw
-        // throw new Error('MAHLORI VIOLATION: Raw text processing detected');
       }
     }
   }
