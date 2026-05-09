@@ -1,409 +1,482 @@
 // engine/siyanda.engine.js
+import ExecutionEngine from './execution.engine.js';
+import DecisionEngine from './decision.engine.js';
+
 class SiyandaEngine {
-  // Main execution handler (no database needed)
-  async executeStep(step, entities, constraints, config, jobId, attempt = 1) {
-    const { action, input } = step;
-    
-    console.log(`🔧 [Siyanda] Executing: ${action} for job ${jobId} (attempt ${attempt})`);
+  //execution point 
+  async execute(payload) {
+    const {
+      jobId,
+      steps,
+      executionConfig,
+      entities,
+      constraints
+    } = payload;
+
+    console.log(`🚀 [Siyanda] Starting execution for job ${jobId}`);
+    console.log(`   Execution order: ${executionConfig.type}`);
+
+    // Clone steps so we can track status without mutating original
+    const stepsWithState = steps.map(step => ({
+      ...step,
+      status: 'pending',   // pending, running, completed, failed, blocked
+      result: null,
+      error: null,
+      retries: 0
+    }));
+
+    // Determine execution order based on config
+    const executionOrder = this.#buildExecutionOrder(executionConfig, stepsWithState);
+
+    // Execute according to order type
+    let finalStatus = 'completed';
+    let finalDecision = null;
+    let reasons = [];
+    let actions = [];
+
     try {
-      // Apply constraints first
-      this.#validateConstraints(action, input, constraints);
-      
-      // Route to appropriate handler based on action type (no DB)
-      const result = await this.#routeAction(action, input, entities, jobId);
-      
-      // Return standardized output
-      return {
-        success: true,
-        data: result,
-        requiresAction: result.requiresAction || false,
-        metadata: {
-          action,
-          executedBy: 'Siyanda',
-          timestamp: new Date().toISOString(),
-          jobId,
-          attempt
-        }
-      };
-      
-    } catch (error) {
-      console.error(`❌ [Siyanda] Error in step ${step.name}:`, error.message);
-      
-      // Handle branching (if/else logic)
-      if (error.type === 'branch_required') {
-        return this.#handleBranching(error, step, entities, jobId);
+      if (executionConfig.type === 'sequential') {
+        const result = await this.#executeSequential(
+          executionOrder,
+          stepsWithState,
+          entities,
+          constraints,
+          executionConfig,
+          jobId
+        );
+        finalStatus = result.status;
+        reasons = result.reasons;
+        actions = result.actions;
+      } else if (executionConfig.type === 'parallel') {
+        const result = await this.#executeParallel(
+          executionOrder,
+          stepsWithState,
+          entities,
+          constraints,
+          executionConfig,
+          jobId
+        );
+        finalStatus = result.status;
+        reasons = result.reasons;
+        actions = result.actions;
+      } else if (executionConfig.type === 'dag') {
+        const result = await this.#executeDAG(
+          executionOrder,
+          stepsWithState,
+          entities,
+          constraints,
+          executionConfig,
+          jobId
+        );
+        finalStatus = result.status;
+        reasons = result.reasons;
+        actions = result.actions;
+      } else {
+        throw new Error(`Unknown execution type: ${executionConfig.type}`);
       }
-      
-      throw error;
+
+      // Extract final decision from steps or DecisionEngine
+      finalDecision = this.#extractFinalDecision(stepsWithState, finalStatus, reasons);
+
+    } catch (error) {
+      console.error(`❌ [Siyanda] Fatal execution error:`, error.message);
+      finalStatus = 'failed';
+      finalDecision = 'Workflow failed';
+      reasons = reasons.length ? reasons : [error.message];
+      actions = ['Check logs', 'Verify inputs', 'Retry workflow'];
+    }
+
+    //formatting for the desired results of the project
+    return {
+      status: finalStatus,
+      decision: finalDecision,
+      reasons: reasons,
+      actions: actions,
+      steps: stepsWithState.map(s => ({
+        id: s.id,
+        name: s.name,
+        action: s.action,
+        status: s.status,
+        result: s.result,
+        error: s.error
+      })),
+      jobId
+    };
+  }
+
+  //execution strategies 
+  async #executeSequential(order, steps, entities, constraints, config, jobId) {
+    let allCompleted = true;
+    const reasons = [];
+    const actions = [];
+
+    for (const stepId of order) {
+      const step = steps.find(s => s.id === stepId);
+      if (!step) continue;
+
+      const result = await this.#executeSingleStep(step, entities, constraints, config, jobId);
+
+      // Update step state
+      step.status = result.status;
+      step.result = result.data || null;
+      step.error = result.error;
+
+      if (result.status === 'failed') {
+        allCompleted = false;
+        reasons.push(`Step "${step.name}" failed: ${result.error}`);
+        actions.push(`Review step ${step.name} and retry`);
+        if (config.onError === 'fail') break;
+      } else if (result.status === 'blocked') {
+        allCompleted = false;
+        reasons.push(...result.reasons);
+        actions.push(...result.actions);
+        break;
+      } else {
+        // merge any updates to entities
+        if (result.updatedEntities) {
+          Object.assign(entities, result.updatedEntities);
+        }
+      }
+    }
+
+    const status = allCompleted ? 'completed' : (steps.some(s => s.status === 'blocked') ? 'blocked' : 'failed');
+    return { status, reasons, actions };
+  }
+
+  async #executeParallel(order, steps, entities, constraints, config, jobId) {
+    // order is an array of arrays
+    const allReasons = [];
+    const allActions = [];
+    let finalStatus = 'completed';
+
+    for (const batch of order) {
+      const batchResults = await Promise.all(
+        batch.map(stepId => {
+          const step = steps.find(s => s.id === stepId);
+          return step ? this.#executeSingleStep(step, entities, constraints, config, jobId) : null;
+        })
+      );
+
+      for (let i = 0; i < batch.length; i++) {
+        const result = batchResults[i];
+        const step = steps.find(s => s.id === batch[i]);
+        if (!step) continue;
+
+        step.status = result.status;
+        step.result = result.data || null;
+        step.error = result.error;
+
+        if (result.status === 'failed') {
+          finalStatus = 'failed';
+          allReasons.push(`Step "${step.name}" failed: ${result.error}`);
+          allActions.push(`Review step ${step.name}`);
+        } else if (result.status === 'blocked') {
+          finalStatus = 'blocked';
+          allReasons.push(...result.reasons);
+          allActions.push(...result.actions);
+        } else {
+          if (result.updatedEntities) Object.assign(entities, result.updatedEntities);
+        }
+      }
+
+      if (finalStatus !== 'completed') break;
+    }
+
+    return { status: finalStatus, reasons: allReasons, actions: allActions };
+  }
+
+  async #executeDAG(order, steps, entities, constraints, config, jobId) {
+    // order is a topological sorted list of step IDs
+    // For DAG we execute in order but we also need to honour dependencies (already sorted)
+    return this.#executeSequential(order, steps, entities, constraints, config, jobId);
+  }
+
+  //single step execution with retries and branching
+  async #executeSingleStep(step, entities, constraints, config, jobId) {
+    const maxRetries = config.maxRetries ?? 0;
+    let attempt = 0;
+    let lastError = null;
+
+    while (attempt <= maxRetries) {
+      try {
+        console.log(`🔧 [Siyanda] Executing step: ${step.name} (${step.action}) attempt ${attempt + 1}`);
+        
+        // Apply constraint validation before step
+        this.#validateStepConstraints(step, constraints);
+
+        // Route to appropriate handler and it includes ExecutionEngine & DecisionEngine
+        const result = await this.#routeAction(step.action, step.input, entities, jobId);
+        
+        return {
+          status: 'completed',
+          data: result.data !== undefined ? result.data : result,
+          error: null,
+          updatedEntities: result.updatedEntities || null
+        };
+      } catch (error) {
+        lastError = error;
+        const isRetryable = error.retryable !== false && attempt < maxRetries;
+        
+        if (isRetryable) {
+          console.warn(`⚠️ Retry ${attempt + 1}/${maxRetries} for step ${step.name}`);
+          attempt++;
+          await this.#delay(1000 * attempt); // exponential backoff not required but nice
+        } else {
+          // Determine if it's a blocking error
+          const isBlocking = error.type === 'blocked' || (error.reason && error.reason.includes('constraint'));
+          return {
+            status: isBlocking ? 'blocked' : 'failed',
+            data: null,
+            error: error.message,
+            reasons: error.violations || [error.reason || error.message],
+            actions: error.actions || ['Check constraints', 'Fix data and retry']
+          };
+        }
+      }
+    }
+
+    return {
+      status: 'failed',
+      data: null,
+      error: lastError.message,
+      reasons: [lastError.message],
+      actions: ['Maximum retries exceeded', 'Investigate step failure']
+    };
+  }
+
+  //==Routing to handlers and intergrates ExecutionEngine & DecisionEngine==
+  
+  async #routeAction(action, input, entities, jobId) {
+    // Business-specific actions – delegate to your existing engines
+    if (action === 'fetch_provider_profile') {
+      const result = await ExecutionEngine.executeStep({ action, input }, entities);
+      return { data: result, updatedEntities: { providerProfile: result } };
+    }
+    if (action === 'fetch_compliance_documents') {
+      const result = await ExecutionEngine.executeStep({ action, input }, entities);
+      return { data: result, updatedEntities: { complianceDocs: result } };
+    }
+    if (action === 'generate_final_decision') {
+      const decision = DecisionEngine.generateDecisions(entities);
+      return {
+        data: decision,
+        updatedEntities: { finalDecision: decision },
+        decisionStatus: decision.status,
+        decisionOutcome: decision.decision,
+        reasons: decision.reasons,
+        actions: decision.actions
+      };
+    }
+
+    // Generic actions (log, calculate, wait, etc.)
+    switch (action) {
+      case 'log':
+        return { data: this.#handleLog(input) };
+      case 'calculate':
+        return { data: this.#handleCalculationSafe(input) };
+      case 'transform_data':
+        return this.#handleTransformData(input, entities);
+      case 'wait':
+        await this.#handleWait(input);
+        return { data: { waited: true } };
+      case 'validate_compliance':
+        return { data: this.#handleComplianceCheck(input, entities) };
+      case 'branch':
+        return await this.#handleBranchCondition(input, entities);
+      case 'send_notification':
+        return { data: await this.#handleNotification(input, jobId) };
+      case 'update_status':
+        return { data: this.#handleStatusUpdate(input) };
+      case 'mock_api_call':
+        return { data: await this.#handleMockApiCall(input) };
+      case 'webhook':
+        return { data: await this.#handleWebhook(input) };
+      default:
+        // If action not recognized, try to delegate to ExecutionEngine as fallback
+        const fallback = await ExecutionEngine.executeStep({ action, input }, entities);
+        return { data: fallback };
     }
   }
-  
-  // Route different action types to handlers (no DB)
-  async #routeAction(action, input, entities, jobId) {
-    const handlers = {
-      // Simple actions (no external dependencies)
-      'log': () => this.#handleLog(input),
-      'calculate': () => this.#handleCalculation(input),
-      'transform_data': () => this.#handleTransformData(input, entities),
-      'wait': () => this.#handleWait(input),
-      'validate_compliance': () => this.#handleComplianceCheck(input, entities),
-      'branch': () => this.#handleBranchCondition(input, entities),
-      'send_notification': () => this.#handleNotification(input, jobId),
-      'update_status': () => this.#handleStatusUpdate(input),
-      'mock_api_call': () => this.#handleMockApiCall(input),
-      'webhook': () => this.#handleWebhook(input),
-      
-      // Default handler
-      'default': () => ({ 
-        message: `Action '${action}' executed successfully`, 
-        input,
-        note: 'No specific handler implemented - using default'
-      })
-    };
-    
-    const handler = handlers[action] || handlers.default;
-    return await handler();
-  }
-  
-  // ========== ACTION HANDLERS (No DB) ==========
-  
-  // Simple logging
+
+  //Safe Handler
   #handleLog(input) {
     const { message, level = 'info' } = input;
     console.log(`[${level.toUpperCase()}] ${message}`);
     return { logged: true, message, level };
   }
-  
-  // Mathematical calculations
-  #handleCalculation(input) {
-    const { operation, a, b, expression } = input;
-    
-    let result;
-    if (expression) {
-      // Safe evaluation (in production, use a proper expression parser)
-      result = Function('"use strict";return (' + expression + ')')();
-    } else {
-      const operations = {
-        'add': (x, y) => x + y,
-        'subtract': (x, y) => x - y,
-        'multiply': (x, y) => x * y,
-        'divide': (x, y) => y !== 0 ? x / y : null,
-        'modulus': (x, y) => x % y,
-        'power': (x, y) => Math.pow(x, y)
-      };
-      
-      const op = operations[operation];
-      if (!op) throw new Error(`Unsupported operation: ${operation}`);
-      
-      result = op(a, b);
-    }
-    
+
+  #handleCalculationSafe(input) {
+    const { operation, a, b } = input;
+    const ops = {
+      add: (x, y) => x + y,
+      subtract: (x, y) => x - y,
+      multiply: (x, y) => x * y,
+      divide: (x, y) => (y !== 0 ? x / y : null),
+      modulus: (x, y) => x % y,
+      power: (x, y) => Math.pow(x, y)
+    };
+    if (!ops[operation]) throw new Error(`Unsupported operation: ${operation}`);
+    const result = ops[operation](a, b);
+    if (result === null) throw new Error('Division by zero');
     return { operation, input: { a, b }, result };
   }
-  
-  // Transform data
+
   #handleTransformData(input, entities) {
     const { source, transform, target } = input;
-    
-    // Get source data
     let sourceData = source === 'entities' ? entities : source;
-    
-    // Apply transformations
     let result = { ...sourceData };
-    
-    if (transform === 'uppercase' && sourceData.text) {
-      result.text = sourceData.text.toUpperCase();
-    } else if (transform === 'lowercase' && sourceData.text) {
-      result.text = sourceData.text.toLowerCase();
-    } else if (transform === 'merge' && input.mergeWith) {
-      result = { ...sourceData, ...input.mergeWith };
-    } else if (transform === 'extract' && input.fields) {
+    if (transform === 'uppercase' && sourceData.text) result.text = sourceData.text.toUpperCase();
+    else if (transform === 'lowercase' && sourceData.text) result.text = sourceData.text.toLowerCase();
+    else if (transform === 'merge' && input.mergeWith) result = { ...sourceData, ...input.mergeWith };
+    else if (transform === 'extract' && input.fields) {
       const extracted = {};
-      input.fields.forEach(field => {
-        extracted[field] = sourceData[field];
-      });
+      input.fields.forEach(field => { extracted[field] = sourceData[field]; });
       result = extracted;
     }
-    
-    return {
-      transformed: true,
-      transform,
-      data: result,
-      updatedEntities: target ? { [target]: result } : null
-    };
+    return { data: result, updatedEntities: target ? { [target]: result } : null };
   }
-  
-  // Wait/Delay
+
   async #handleWait(input) {
-    const { durationMs, durationSec } = input;
-    const waitTime = durationMs || (durationSec * 1000) || 1000;
-    
-    console.log(`⏳ Waiting for ${waitTime}ms...`);
-    await new Promise(resolve => setTimeout(resolve, waitTime));
-    
-    return { waited: true, durationMs: waitTime };
+    const durationMs = input.durationMs || input.durationSec * 1000 || 1000;
+    await new Promise(resolve => setTimeout(resolve, durationMs));
   }
-  
-  // Compliance checking (no external DB)
+
   #handleComplianceCheck(input, entities) {
     const { rules, data_path, expected_value } = input;
-    
-    // Extract data from entities or input
-    let dataToCheck = entities;
-    if (data_path) {
-      dataToCheck = this.#getNestedValue(entities, data_path);
-    }
-    
-    // Apply compliance rules
+    let dataToCheck = data_path ? this.#getNestedValue(entities, data_path) : entities;
     const violations = [];
-    
     for (const rule of (rules || [])) {
-      const actualValue = this.#getNestedValue(dataToCheck, rule.field);
-      const isCompliant = this.#evaluateOperator(actualValue, rule.operator, rule.value);
-      
-      if (!isCompliant) {
-        violations.push({
-          rule: rule.name || 'unnamed_rule',
-          field: rule.field,
-          expected: rule.value,
-          actual: actualValue,
-          operator: rule.operator
-        });
+      const actual = this.#getNestedValue(dataToCheck, rule.field);
+      const compliant = this.#evaluateOperator(actual, rule.operator, rule.value);
+      if (!compliant) {
+        violations.push({ rule: rule.name, field: rule.field, expected: rule.value, actual, operator: rule.operator });
       }
     }
-    
-    if (violations.length > 0) {
-      throw {
-        type: 'blocked',
-        reason: 'Compliance check failed',
-        violations,
-        retryable: false
-      };
+    if (violations.length) {
+      throw { type: 'blocked', reason: 'Compliance check failed', violations, retryable: false };
     }
-    
-    return { 
-      compliant: true, 
-      checked: (rules?.length || 0),
-      message: 'All compliance checks passed'
-    };
+    return { compliant: true, checked: rules?.length || 0 };
   }
-  
-  // Branch condition evaluation
+
   async #handleBranchCondition(input, entities) {
     const { condition, true_branch, false_branch } = input;
-    
-    // Evaluate condition
     const conditionMet = this.#evaluateCondition(condition, entities);
-    
     if (conditionMet && true_branch) {
-      console.log(`🌿 Branch: Taking TRUE branch`);
-      return await this.#routeAction(true_branch.action, true_branch.input, entities);
+      const branchResult = await this.#routeAction(true_branch.action, true_branch.input, entities);
+      return { data: branchResult.data, branch: 'true' };
     } else if (!conditionMet && false_branch) {
-      console.log(`🌿 Branch: Taking FALSE branch`);
-      return await this.#routeAction(false_branch.action, false_branch.input, entities);
+      const branchResult = await this.#routeAction(false_branch.action, false_branch.input, entities);
+      return { data: branchResult.data, branch: 'false' };
     }
-    
-    return {
-      conditionMet,
-      branch: conditionMet ? 'true' : 'false',
-      message: `Condition evaluated to ${conditionMet}`
-    };
+    return { data: { conditionMet, branch: conditionMet ? 'true' : 'false' } };
   }
-  
-  // Notifications (console, email mock, webhook)
+
   async #handleNotification(input, jobId) {
     const { type, recipient, message, channel = 'console' } = input;
-    
-    if (channel === 'console') {
-      console.log(`📢 [NOTIFICATION] [${type}] ${message}`);
-      if (recipient) console.log(`   Recipient: ${recipient}`);
-    } else if (channel === 'email') {
-      // Mock email - just log it
-      console.log(`📧 [EMAIL] To: ${recipient}`);
-      console.log(`   Subject: ${type}`);
-      console.log(`   Body: ${message}`);
-    } else if (channel === 'webhook') {
-      // Mock webhook call
-      console.log(`🔗 [WEBHOOK] Calling ${recipient}`);
-      console.log(`   Payload: ${JSON.stringify({ type, message, jobId })}`);
-    }
-    
-    return { 
-      sent: true, 
-      channel, 
-      recipient,
-      message,
-      timestamp: new Date().toISOString()
-    };
+    if (channel === 'console') console.log(`📢 [NOTIFICATION] [${type}] ${message} ${recipient ? `To: ${recipient}` : ''}`);
+    else if (channel === 'email') console.log(`📧 [EMAIL] To: ${recipient}\n   Subject: ${type}\n   Body: ${message}`);
+    else if (channel === 'webhook') console.log(`🔗 [WEBHOOK] Call ${recipient}\n   Payload: ${JSON.stringify({ type, message, jobId })}`);
+    return { sent: true, channel, recipient, message };
   }
-  
-  // Status update (no DB - just in memory)
+
   #handleStatusUpdate(input) {
     const { entity_type, entity_id, status, metadata = {} } = input;
-    
     console.log(`📝 [STATUS UPDATE] ${entity_type}/${entity_id} -> ${status}`);
-    if (Object.keys(metadata).length > 0) {
-      console.log(`   Metadata:`, metadata);
-    }
-    
-    return {
-      updated: true,
-      entity_type,
-      entity_id,
-      status,
-      metadata,
-      timestamp: new Date().toISOString()
-    };
+    return { updated: true, entity_type, entity_id, status, metadata };
   }
-  
-  // Mock API call (simulates external API without actual network)
+
   async #handleMockApiCall(input) {
     const { url, method = 'GET', response_delay = 100, mock_response, status_code = 200 } = input;
-    
-    console.log(`🎭 [MOCK API] ${method} ${url} (delay: ${response_delay}ms)`);
-    
-    // Simulate network delay
-    if (response_delay > 0) {
-      await new Promise(resolve => setTimeout(resolve, response_delay));
-    }
-    
-    // Return mock response
-    const response = {
-      status: status_code,
-      data: mock_response || {
-        message: `Mock response for ${url}`,
-        timestamp: new Date().toISOString()
-      },
-      headers: {
-        'content-type': 'application/json',
-        'x-mock-response': 'true'
-      }
-    };
-    
-    // Simulate error for non-200 status
-    if (status_code >= 400) {
-      throw {
-        type: 'failed',
-        reason: `API returned ${status_code}`,
-        response,
-        retryable: status_code >= 500
-      };
-    }
-    
-    return response;
+    console.log(`🎭 [MOCK API] ${method} ${url}`);
+    if (response_delay) await this.#delay(response_delay);
+    if (status_code >= 400) throw { type: 'failed', reason: `API returned ${status_code}`, retryable: status_code >= 500 };
+    return { status: status_code, data: mock_response || { message: `Mock response for ${url}` }, headers: { 'content-type': 'application/json' } };
   }
-  
-  // Webhook caller
+
   async #handleWebhook(input) {
-    const { url, method = 'POST', payload, headers = {} } = input;
-    
-    console.log(`🔗 [WEBHOOK] ${method} ${url}`);
-    console.log(`   Payload:`, payload);
-    
-    // In a real implementation, you'd use fetch/axios here
-    // For now, just log and return mock response
-    return {
-      called: true,
-      url,
-      method,
-      payload,
-      response: {
-        status: 200,
-        message: 'Webhook would be called here (no HTTP client configured)'
-      }
-    };
+    const { url, method = 'POST', payload } = input;
+    console.log(`🔗 [WEBHOOK] ${method} ${url}\n   Payload:`, payload);
+    return { called: true, url, method, payload, response: { status: 200, message: 'Webhook would be called here' } };
   }
-  
-  // ========== HELPER METHODS ==========
-  
+
+  //Helper Methods
   #evaluateCondition(condition, entities) {
     if (!condition) return false;
-    
     const { field, operator, value, logical = 'AND', conditions } = condition;
-    
-    // Simple condition
     if (field && operator) {
-      const actualValue = this.#getNestedValue(entities, field);
-      return this.#evaluateOperator(actualValue, operator, value);
+      const actual = this.#getNestedValue(entities, field);
+      return this.#evaluateOperator(actual, operator, value);
     }
-    
-    // Compound conditions
     if (conditions && Array.isArray(conditions)) {
-      const results = conditions.map(cond => this.#evaluateCondition(cond, entities));
-      
-      if (logical === 'AND') {
-        return results.every(r => r === true);
-      } else if (logical === 'OR') {
-        return results.some(r => r === true);
-      }
+      const results = conditions.map(c => this.#evaluateCondition(c, entities));
+      return logical === 'AND' ? results.every(r => r) : results.some(r => r);
     }
-    
     return false;
   }
-  
+
   #evaluateOperator(actual, operator, expected) {
-    const operators = {
-      'eq': (a, e) => a == e,
-      'neq': (a, e) => a != e,
-      'gt': (a, e) => a > e,
-      'gte': (a, e) => a >= e,
-      'lt': (a, e) => a < e,
-      'lte': (a, e) => a <= e,
-      'contains': (a, e) => String(a).includes(e),
-      'startsWith': (a, e) => String(a).startsWith(e),
-      'endsWith': (a, e) => String(a).endsWith(e),
-      'in': (a, e) => Array.isArray(e) && e.includes(a),
-      'exists': (a) => a !== undefined && a !== null,
-      'empty': (a) => !a || (Array.isArray(a) && a.length === 0) || (typeof a === 'object' && Object.keys(a).length === 0)
+    const ops = {
+      eq: (a, e) => a == e,
+      neq: (a, e) => a != e,
+      gt: (a, e) => a > e,
+      gte: (a, e) => a >= e,
+      lt: (a, e) => a < e,
+      lte: (a, e) => a <= e,
+      contains: (a, e) => String(a).includes(e),
+      startsWith: (a, e) => String(a).startsWith(e),
+      endsWith: (a, e) => String(a).endsWith(e),
+      in: (a, e) => Array.isArray(e) && e.includes(a),
+      exists: a => a !== undefined && a !== null,
+      empty: a => !a || (Array.isArray(a) && a.length === 0) || (typeof a === 'object' && Object.keys(a).length === 0)
     };
-    
-    const operatorFn = operators[operator];
-    if (!operatorFn) {
-      console.warn(`Unknown operator: ${operator}, defaulting to eq`);
-      return actual == expected;
-    }
-    
-    return operatorFn(actual, expected);
+    const fn = ops[operator];
+    return fn ? fn(actual, expected) : actual == expected;
   }
-  
+
   #getNestedValue(obj, path) {
     if (!path) return obj;
     return path.split('.').reduce((curr, key) => curr?.[key], obj);
   }
-  
-  #validateConstraints(action, input, constraints) {
-    if (!constraints) return true;
-    
-    // Apply global constraints
-    if (constraints.blocked_actions?.includes(action)) {
-      throw {
-        type: 'blocked',
-        reason: `Action '${action}' is blocked by constraints`,
-        retryable: false
-      };
+
+  #validateStepConstraints(step, constraints) {
+    if (!constraints) return;
+    if (constraints.blocked_actions?.includes(step.action)) {
+      throw { type: 'blocked', reason: `Action '${step.action}' is blocked`, retryable: false };
     }
-    
-    // Check required fields
-    if (constraints.required_fields?.[action]) {
-      const missing = constraints.required_fields[action].filter(
-        field => !input[field]
-      );
-      
-      if (missing.length > 0) {
-        throw {
-          type: 'failed',
-          reason: `Missing required fields: ${missing.join(', ')}`,
-          missing,
-          retryable: true
-        };
+    if (constraints.required_fields?.[step.action]) {
+      const missing = constraints.required_fields[step.action].filter(f => !step.input?.[f]);
+      if (missing.length) {
+        throw { type: 'failed', reason: `Missing required fields: ${missing.join(', ')}`, retryable: true };
       }
     }
-    
-    return true;
   }
-  
-  #handleBranching(error, step, entities, jobId) {
-    throw error;
+
+  #buildExecutionOrder(config, steps) {
+    if (config.type === 'sequential') {
+      return config.order; // already an array of step IDs
+    } else if (config.type === 'parallel') {
+      // config.order is an array of arrays
+      return config.order;
+    } else if (config.type === 'dag') {
+      return config.order;
+    }
+    return steps.map(s => s.id);
+  }
+
+  #extractFinalDecision(steps, finalStatus, reasons) {
+    // Look for a step that generated a decision
+    const decisionStep = steps.find(s => s.action === 'generate_final_decision' && s.result);
+    if (decisionStep && decisionStep.result.decision) {
+      return decisionStep.result.decision;
+    }
+    // Fallback based on status
+    if (finalStatus === 'completed') return 'Goal achieved';
+    if (finalStatus === 'blocked') return 'Workflow blocked';
+    return 'Workflow failed';
+  }
+
+  #delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 }
 
