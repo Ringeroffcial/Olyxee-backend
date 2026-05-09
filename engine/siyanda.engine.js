@@ -1,4 +1,3 @@
-// engine/siyanda.engine.js
 import ExecutionEngine from './execution.engine.js';
 import DecisionEngine from './decision.engine.js';
 
